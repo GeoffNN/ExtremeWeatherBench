@@ -2,9 +2,10 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 import xarray as xr
 
-from extremeweatherbench import metrics, regions, utils
+from extremeweatherbench import cases, metrics, regions, utils
 from extremeweatherbench.sources import xarray_dataset
 
 
@@ -45,6 +46,49 @@ def test_check_for_spatial_data_handles_antimeridian_seam():
         longitude_max=-100.0,
     )
     assert xarray_dataset.check_for_spatial_data(ds, region)
+
+
+def _global_grid(step: float = 0.25, lon_min: float = 0.0) -> xr.Dataset:
+    longitude = np.arange(lon_min, lon_min + 360.0, step)
+    latitude = np.arange(40.0, 76.0, step)
+    data = np.broadcast_to(
+        np.sin(np.deg2rad(longitude)), (latitude.size, longitude.size)
+    ).copy()
+    return xr.Dataset(
+        {"v": (["latitude", "longitude"], data)},
+        coords={"latitude": latitude, "longitude": longitude},
+    )
+
+
+@pytest.mark.parametrize(
+    ("region_spec", "lon_min", "span"),
+    [
+        (125, 0.0, 32.4),
+        (143, 0.0, 19.8),
+        ("antimeridian", -180.0, 10.0),
+    ],
+)
+def test_wrapping_region_mask_is_contiguous(region_spec, lon_min, span):
+    """A region that wraps a longitude seam masks to one unbroken block."""
+    step = 0.25
+    if region_spec == "antimeridian":
+        region = regions.BoundingBoxRegion.create_region(
+            latitude_min=45.0,
+            latitude_max=70.0,
+            longitude_min=175.0,
+            longitude_max=-175.0,
+        )
+    else:
+        region = next(
+            case.location
+            for case in cases.load_cases()
+            if case.case_id_number == region_spec
+        )
+    grid = _global_grid(step, lon_min)
+    longitude = region.mask(grid).longitude.values
+    assert longitude.size < grid.sizes["longitude"]
+    np.testing.assert_allclose(np.diff(longitude), step)
+    assert longitude.max() - longitude.min() == pytest.approx(span, abs=2 * step)
 
 
 def _build_forecast_target(target_values: np.ndarray) -> tuple:

@@ -81,13 +81,14 @@ class Region(abc.ABC):
                 stacklevel=2,
             )
 
-        # Get region bounds adjusted to dataset's longitude convention
         (
             region_longitude_min,
             region_latitude_min,
             region_longitude_max,
             region_latitude_max,
-        ) = self.get_adjusted_bounds(dataset)
+        ) = _adjust_bounds_to_dataset_convention(
+            _wrapping_bounds(self.as_geopandas()), dataset
+        )
 
         # Avoids slice() which is susceptible to differences in coord order
         latitude_da = dataset.latitude.where(
@@ -98,18 +99,8 @@ class Region(abc.ABC):
             drop=True,
         )
 
-        # Detect if region wraps around 0/360 or -180/180 boundary
-        # This happens either from:
-        # 1. True antimeridian crossing (MultiPolygon geometry)
-        # 2. Prime meridian crossing converted to 0-360 (lon_min > lon_max)
-        gdf = self.as_geopandas()
-        geometry = gdf.geometry.iloc[0]
-        crosses_boundary = isinstance(geometry, shapely.MultiPolygon) or (
-            region_longitude_min > region_longitude_max
-        )
-
-        if crosses_boundary:
-            # Use OR condition: include lons >= min OR lons <= max
+        wraps = region_longitude_min > region_longitude_max
+        if wraps:
             longitude_da = dataset.longitude.where(
                 np.logical_or(
                     dataset.longitude >= region_longitude_min,
@@ -125,11 +116,16 @@ class Region(abc.ABC):
                 ),
                 drop=True,
             )
-        dataset = dataset.sel(
-            latitude=latitude_da,
-            longitude=longitude_da,
-        )
-
+        dataset = dataset.sel(latitude=latitude_da, longitude=longitude_da)
+        if wraps:
+            # OR-selection leaves a gap across the seam; unwrap into one run.
+            longitude = (
+                region_longitude_min
+                + (dataset.longitude - region_longitude_min) % 360.0
+            )
+            if float(longitude.max()) >= 360.0:
+                longitude = longitude - 360.0
+            dataset = dataset.assign_coords(longitude=longitude).sortby("longitude")
         return dataset
 
     def intersects(self, other: "Region") -> bool:
@@ -415,6 +411,25 @@ def map_to_create_region(region_input: Region | dict) -> Region:
     if region_parameters is None:
         region_parameters = {}
     return region_class.create_region(**region_parameters)
+
+
+def _wrapping_bounds(
+    gdf: gpd.GeoDataFrame,
+) -> tuple[float, float, float, float]:
+    """Return (lon_min, lat_min, lon_max, lat_max), wrapping if needed.
+
+    Antimeridian regions are MultiPolygons whose total_bounds span the
+    globe. The wrap is recovered from the lobes that touch ±180.
+    """
+    lon_min, lat_min, lon_max, lat_max = gdf.total_bounds
+    if not isinstance(gdf.geometry.iloc[0], shapely.MultiPolygon):
+        return lon_min, lat_min, lon_max, lat_max
+    lobes = gdf.geometry.explode(index_parts=False).bounds
+    east = lobes[np.isclose(lobes.maxx, 180.0)]
+    west = lobes[np.isclose(lobes.minx, -180.0)]
+    if east.empty or west.empty:
+        return lon_min, lat_min, lon_max, lat_max
+    return east.minx.min(), lat_min, west.maxx.max(), lat_max
 
 
 def _create_geopandas_from_bounds(
