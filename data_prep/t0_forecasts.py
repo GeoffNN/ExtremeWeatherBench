@@ -9,7 +9,7 @@ import argparse
 from collections.abc import Callable, Sequence
 from importlib.metadata import version
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import xarray as xr
@@ -32,15 +32,20 @@ def generate_forecasts(
     context_length: int = 512,
     horizon: int = 40,
     batch_size: int = 32,
+    grouping: Literal["joint", "independent"] = "joint",
 ) -> xr.Dataset:
     """Forecast each grid cell using only samples through each initialization.
 
-    ``predict`` receives independent univariate rows and returns their medians.
+    ``predict`` receives all grid cells together in joint mode and returns their
+    medians. The caller must configure its model to treat these rows as one
+    group. Independent mode instead splits rows into batches of ``batch_size``.
     The input variable must already have its EWB name and units. Only finite
     histories on a regular time axis and a rectilinear grid are supported.
     """
     if min(context_length, horizon, batch_size) < 1:
         raise ValueError("context_length, horizon and batch_size must be positive")
+    if grouping not in ("joint", "independent"):
+        raise ValueError("grouping must be 'joint' or 'independent'")
     if history.name is None or set(history.dims) != {"time", "latitude", "longitude"}:
         raise ValueError("Provide a named variable with time, latitude, longitude axes")
     for axis in ("time", "latitude", "longitude"):
@@ -101,9 +106,10 @@ def generate_forecasts(
         output: Float[NDArray[np.float32], "grid horizon"] = np.empty(
             (n_lat * n_lon, horizon), dtype=np.float32
         )
-        for start in range(0, len(context), batch_size):
+        rows_per_call: int = len(context) if grouping == "joint" else batch_size
+        for start in range(0, len(context), rows_per_call):
             batch: Float[NDArray[np.float32], "batch time"] = context[
-                start : start + batch_size
+                start : start + rows_per_call
             ]
             median: Float[NDArray[np.float32], "batch horizon"] = np.asarray(
                 predict(batch, horizon), dtype=np.float32
@@ -138,7 +144,18 @@ def main() -> None:
     parser.add_argument("--init-time", required=True, action="append")
     parser.add_argument("--context-length", type=int, default=512)
     parser.add_argument("--horizon", type=int, default=40)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Grid cells per call in independent mode only",
+    )
+    parser.add_argument(
+        "--grouping",
+        choices=("joint", "independent"),
+        default="joint",
+        help="Jointly forecast all grid cells as targets in one group (default)",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--revision", default="main")
     args: argparse.Namespace = parser.parse_args()
@@ -164,7 +181,14 @@ def main() -> None:
         context: Float[NDArray[np.float32], "batch time"], horizon: int
     ) -> Float[NDArray[np.float32], "batch horizon"]:
         return (
-            model.predict(context, horizon=horizon, quantile_levels=[0.5])
+            model.predict(
+                context,
+                horizon=horizon,
+                quantile_levels=[0.5],
+                group_ids=np.zeros(len(context), dtype=np.int64)
+                if args.grouping == "joint"
+                else None,
+            )
             .median.cpu()
             .numpy()
         )
@@ -177,6 +201,7 @@ def main() -> None:
             context_length=args.context_length,
             horizon=args.horizon,
             batch_size=args.batch_size,
+            grouping=args.grouping,
         )
     forecasts.attrs.update(
         model=MODEL_ID,
@@ -184,7 +209,10 @@ def main() -> None:
         runtime_version=runtime_version,
         context_length=args.context_length,
         forecast_statistic="median",
-        inference="independent univariate grid cells",
+        grouping=args.grouping,
+        inference="all grid cells as targets in one group"
+        if args.grouping == "joint"
+        else "independent univariate grid cells",
     )
     forecasts.to_netcdf(args.output)
     print(f"Wrote {args.output}")

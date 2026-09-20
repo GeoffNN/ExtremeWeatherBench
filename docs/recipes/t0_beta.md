@@ -2,12 +2,14 @@
 
 [t0-beta](https://huggingface.co/theforecastingcompany/t0-beta) is a general
 purpose time-series model from The Forecasting Company. The preparation script
-`data_prep/t0_forecasts.py` runs it independently at each grid cell and writes
+`data_prep/t0_forecasts.py` forecasts all grid cells as targets in one group and writes
 median forecasts that EWB can evaluate through `XarrayForecast`.
 
-This is a univariate baseline: it does not use spatial attention, other weather
-variables, or future covariates. It evaluates deterministic medians, not the
-model's full predictive distribution. No benchmark scores are supplied here.
+The shared group lets the model use relationships between grid-cell histories.
+This example uses one weather variable and no future covariates. It evaluates
+deterministic medians rather than the full predictive distribution. An optional
+independent-grid-cell mode is available as a baseline. No benchmark scores are
+supplied here.
 
 ## Generate forecasts
 
@@ -20,7 +22,7 @@ uv run --no-sync python data_prep/t0_forecasts.py \
     --input temperature_history.nc \
     --variable surface_air_temperature \
     --init-time 2021-06-25T00:00:00 \
-    --context-length 512 --horizon 40 --batch-size 32 \
+    --context-length 1024 --horizon 40 \
     --output t0_beta_forecasts.nc
 ```
 
@@ -29,7 +31,12 @@ The input is a local NetCDF file containing the selected variable with dimension
 and a rectilinear grid. Rename input variables and coordinates to EWB conventions
 before running; for example, ERA5 `t2m` becomes `surface_air_temperature`, in kelvin.
 The script preserves units and does not convert them. Subset the grid to cover the
-event region before generation; output is assembled in memory.
+event region before generation; output is assembled in memory. The default
+`--grouping joint` sends all grid cells together with the same `group_ids` value,
+so every cell is a forecast target in the same group. Joint attention and longer
+contexts increase memory requirements; `--batch-size` does not split this group.
+Use `--grouping independent --batch-size 32` for a baseline that processes cells
+independently in batches.
 
 Each `--init-time` (repeat the option for multiple initializations) must occur in
 the input. The context includes that timestamp and the preceding
@@ -38,6 +45,10 @@ one input sampling interval after initialization; `horizon` counts samples,
 not hours. With six-hourly input, `--horizon 40` produces ten days of forecasts.
 Missing or infinite history values are rejected. Negative longitudes are
 converted to the 0–360 convention and sorted with their data.
+
+`--context-length` controls how much history is supplied (default 512 samples).
+The example uses 1024 samples, or 256 days at six-hourly cadence; ensure the input
+contains that many observations through every requested initialization.
 
 The runtime must be at least 0.5.0 to read t0-beta's normalization configuration.
 Use `--device cuda` for GPU inference (CPU is the default). For reproducibility,

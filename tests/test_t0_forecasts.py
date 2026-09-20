@@ -1,6 +1,10 @@
 """Tests for preparing t0-beta forecasts without loading model weights."""
 
 from pathlib import Path
+import sys
+import types
+from typing import Literal
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -8,6 +12,7 @@ import xarray as xr
 from numpy.typing import NDArray
 
 from data_prep.t0_forecasts import generate_forecasts
+from data_prep import t0_forecasts
 
 
 def make_history() -> xr.DataArray:
@@ -40,7 +45,13 @@ def test_batches_preserve_gridpoints_and_use_only_available_history() -> None:
 
     init_times: list[np.datetime64] = [history.time.values[2], history.time.values[4]]
     result: xr.Dataset = generate_forecasts(
-        history, init_times, predict, context_length=3, horizon=2, batch_size=4
+        history,
+        init_times,
+        predict,
+        context_length=3,
+        horizon=2,
+        batch_size=4,
+        grouping="independent",
     )
 
     assert result.sizes == {
@@ -110,7 +121,14 @@ def test_rejects_nonpositive_counts(parameter: str, value: int) -> None:
     options: dict[str, int] = {"context_length": 3, "horizon": 2, "batch_size": 4}
     options[parameter] = value
     with pytest.raises(ValueError):
-        generate_forecasts(history, [history.time.values[2]], persistence, **options)
+        generate_forecasts(
+            history,
+            [history.time.values[2]],
+            persistence,
+            context_length=options["context_length"],
+            horizon=options["horizon"],
+            batch_size=options["batch_size"],
+        )
 
 
 def test_rejects_irregular_history() -> None:
@@ -207,3 +225,99 @@ def test_netcdf_roundtrip_preserves_forecast(tmp_path: Path) -> None:
     result.to_netcdf(tmp_path / "forecast.nc")
     with xr.open_dataset(tmp_path / "forecast.nc", decode_timedelta=True) as restored:
         xr.testing.assert_equal(result, restored)
+
+
+def test_joint_group_preserves_cross_cell_context_and_all_targets() -> None:
+    history: xr.DataArray = make_history()
+    batches: list[NDArray[np.float32]] = []
+
+    def predict(context: NDArray[np.float32], horizon: int) -> NDArray[np.float32]:
+        batches.append(context.copy())
+        return np.repeat(context[:, -1:] + context[:, -1].mean(), horizon, axis=1)
+
+    result: xr.Dataset = generate_forecasts(
+        history,
+        [history.time.values[2], history.time.values[4]],
+        predict,
+        context_length=3,
+        horizon=2,
+        batch_size=2,
+    )
+    assert [batch.shape for batch in batches] == [(6, 3), (6, 3)]
+    for index, stop in enumerate([2, 4]):
+        np.testing.assert_array_equal(
+            batches[index], history.values[stop - 2 : stop + 1].reshape(3, 6).T
+        )
+        last: NDArray[np.float64] = history.values[stop]
+        expected: NDArray[np.float64] = np.repeat((last + last.mean())[None], 2, axis=0)
+        np.testing.assert_array_equal(
+            result.surface_air_temperature.isel(init_time=index).values, expected
+        )
+
+
+@pytest.mark.parametrize("grouping", ["joint", "independent"])
+def test_cli_passes_group_ids_for_all_grid_targets(
+    grouping: Literal["joint", "independent"],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history: xr.DataArray = make_history()
+    input_path: Path = tmp_path / "history.nc"
+    output_path: Path = tmp_path / "forecast.nc"
+    history.to_dataset().to_netcdf(input_path)
+    model: MagicMock = MagicMock()
+
+    def predict(
+        context: NDArray[np.float32],
+        *,
+        horizon: int,
+        quantile_levels: list[float],
+        group_ids: NDArray[np.int64] | None,
+    ) -> MagicMock:
+        assert quantile_levels == [0.5]
+        if grouping == "joint":
+            assert len(context) == 6
+            np.testing.assert_array_equal(group_ids, np.zeros(6, dtype=np.int64))
+        else:
+            assert len(context) == 2
+            assert group_ids is None
+        result: MagicMock = MagicMock()
+        result.median.cpu.return_value.numpy.return_value = persistence(
+            context, horizon
+        )
+        return result
+
+    model.predict.side_effect = predict
+    factory: MagicMock = MagicMock()
+    factory.from_pretrained.return_value.to.return_value.eval.return_value = model
+    runtime: types.ModuleType = types.ModuleType("t0")
+    setattr(runtime, "T0Forecaster", factory)
+    monkeypatch.setitem(sys.modules, "t0", runtime)
+    monkeypatch.setattr(t0_forecasts, "version", lambda name: "0.5.0")
+    arguments: list[str] = [
+        "t0_forecasts.py",
+        "--input",
+        str(input_path),
+        "--output",
+        str(output_path),
+        "--variable",
+        "surface_air_temperature",
+        "--init-time",
+        "2024-06-01T12",
+        "--context-length",
+        "3",
+        "--horizon",
+        "2",
+        "--batch-size",
+        "2",
+    ]
+    if grouping == "independent":
+        arguments.extend(["--grouping", "independent"])
+    monkeypatch.setattr(sys, "argv", arguments)
+    t0_forecasts.main()
+    assert model.predict.call_count == (1 if grouping == "joint" else 3)
+    with xr.open_dataset(output_path, decode_timedelta=True) as result:
+        assert result.attrs["grouping"] == grouping
+        np.testing.assert_array_equal(
+            result.surface_air_temperature.values[0, 0], history.values[2]
+        )
