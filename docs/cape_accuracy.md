@@ -27,10 +27,10 @@ taking a fixed 16 substeps across each gap (`_cape.MOIST_ASCENT_SUBSTEPS`).
 **2. The molecular-weight ratio $\epsilon$.** The package previously carried two
 values of the ratio of the molecular weights of water vapor and dry air: the
 rounded `0.622` inside `_cape.py`, and the unrounded `0.6219569100577033` in
-`calc.py` and the severe-convection module. These are now a single constant,
-`_cape.EPSILON`, set to the unrounded value and imported everywhere else. It is
-defined in `_cape.py` because that module imports nothing else from the package,
-so any module can take it without an import cycle.
+These are now a single constant, `constants.EPSILON`, set to the
+unrounded value and imported everywhere else. `_cape.py` re-exports it so Numba
+kernels can bind the module global without an import cycle; it is defined in the
+leaf `constants.py` module.
 
 ## Size of the shift
 
