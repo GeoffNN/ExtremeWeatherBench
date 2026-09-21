@@ -22,7 +22,7 @@ MODEL_ID: str = "theforecastingcompany/t0-beta"
 
 
 def generate_forecasts(
-    history: xr.DataArray,
+    history: xr.DataArray | xr.Dataset,
     init_times: Sequence[np.datetime64],
     predict: Callable[
         [Float[NDArray[np.float32], "batch time"], int],
@@ -34,20 +34,40 @@ def generate_forecasts(
     batch_size: int = 32,
     grouping: Literal["joint", "independent"] = "joint",
 ) -> xr.Dataset:
-    """Forecast each grid cell using only samples through each initialization.
+    """Stack every variable's non-time dimensions into joint target variates.
 
-    ``predict`` receives all grid cells together in joint mode and returns their
-    medians. The caller must configure its model to treat these rows as one
-    group. Independent mode instead splits rows into batches of ``batch_size``.
-    The input variable must already have its EWB name and units. Only finite
-    histories on a regular time axis and a rectilinear grid are supported.
+    ``predict`` receives [V, time] and returns [V, horizon]. Surface variables
+    are not broadcast over pressure levels. Original dimensions and attributes
+    are restored after inference. The caller must configure joint rows as one
+    group; independent mode splits rows into batches of ``batch_size``.
+    Variables must already use EWB names and units. Only finite histories on
+    a shared regular time axis and rectilinear grid are supported.
     """
     if min(context_length, horizon, batch_size) < 1:
         raise ValueError("context_length, horizon and batch_size must be positive")
     if grouping not in ("joint", "independent"):
         raise ValueError("grouping must be 'joint' or 'independent'")
-    if history.name is None or set(history.dims) != {"time", "latitude", "longitude"}:
-        raise ValueError("Provide a named variable with time, latitude, longitude axes")
+    if isinstance(history, xr.DataArray):
+        if history.name is None:
+            raise ValueError("Provide a named variable")
+        history = history.to_dataset()
+    if not history.data_vars:
+        raise ValueError("Provide at least one target variable")
+    for reserved in ("init_time", "lead_time"):
+        if (
+            reserved in history.coords
+            or reserved in history.dims
+            or reserved in history.data_vars
+        ):
+            raise ValueError(f"{reserved} is reserved for forecast output")
+    for name, field in history.data_vars.items():
+        if not {"time", "latitude", "longitude"}.issubset(field.dims):
+            raise ValueError(f"{name} must have time, latitude, longitude axes")
+        for axis in field.dims:
+            if axis not in history.coords or history[axis].dims != (axis,):
+                raise ValueError(f"{axis} must be a one-dimensional coordinate")
+            if history.sizes[axis] == 0 or history[axis].to_index().has_duplicates:
+                raise ValueError(f"{axis} must be nonempty and unique")
     for axis in ("time", "latitude", "longitude"):
         if axis not in history.coords or history[axis].dims != (axis,):
             raise ValueError(f"{axis} must be a one-dimensional coordinate")
@@ -86,25 +106,39 @@ def generate_forecasts(
     for axis in ("latitude", "longitude"):
         if len(np.unique(history[axis])) != history.sizes[axis]:
             raise ValueError(f"{axis} must contain unique coordinates")
-    history = history.transpose("time", "latitude", "longitude")
-    n_lat: int = history.sizes["latitude"]
-    n_lon: int = history.sizes["longitude"]
-    forecasts: NDArray[np.float32] = np.empty(
-        (len(initializations), horizon, n_lat, n_lon), dtype=np.float32
+    fields: list[xr.DataArray] = [
+        field.transpose(
+            "time",
+            *[
+                axis
+                for axis in field.dims
+                if axis not in ("time", "latitude", "longitude")
+            ],
+            "latitude",
+            "longitude",
+        )
+        for field in history.data_vars.values()
+    ]
+    widths: list[int] = [int(np.prod(field.shape[1:])) for field in fields]
+    forecasts: Float[NDArray[np.float32], "init V horizon"] = np.empty(
+        (len(initializations), sum(widths), horizon), dtype=np.float32
     )
     for init_index, stop in enumerate(indices):
-        context: Float[NDArray[np.float32], "grid time"] = (
-            np.asarray(
-                history.isel(time=slice(stop - context_length + 1, stop + 1)).values,
-                dtype=np.float32,
-            )
-            .reshape(context_length, -1)
-            .T
+        context: Float[NDArray[np.float32], "V time"] = np.concatenate(
+            [
+                np.asarray(
+                    field.isel(time=slice(stop - context_length + 1, stop + 1)).values,
+                    dtype=np.float32,
+                )
+                .reshape(context_length, width)
+                .T
+                for field, width in zip(fields, widths, strict=True)
+            ]
         )
         if not np.isfinite(context).all():
             raise ValueError("History context must contain only finite values")
         output: Float[NDArray[np.float32], "grid horizon"] = np.empty(
-            (n_lat * n_lon, horizon), dtype=np.float32
+            (sum(widths), horizon), dtype=np.float32
         )
         rows_per_call: int = len(context) if grouping == "joint" else batch_size
         for start in range(0, len(context), rows_per_call):
@@ -119,20 +153,28 @@ def generate_forecasts(
             if not np.isfinite(median).all():
                 raise ValueError("Predictor returned nonfinite values")
             output[start : start + len(batch)] = median
-        forecasts[init_index] = output.T.reshape(horizon, n_lat, n_lon)
-    result: xr.DataArray = xr.DataArray(
-        forecasts,
-        dims=("init_time", "lead_time", "latitude", "longitude"),
-        coords={
-            "init_time": initializations.astype("datetime64[ns]"),
-            "lead_time": np.arange(1, horizon + 1) * steps[0],
-            "latitude": history.latitude,
-            "longitude": history.longitude,
-        },
-        name=history.name,
-        attrs=history.attrs.copy(),
-    )
-    return result.to_dataset()
+        forecasts[init_index] = output
+    result: xr.Dataset = xr.Dataset(attrs=history.attrs.copy())
+    offset: int = 0
+    for field, width in zip(fields, widths, strict=True):
+        result[str(field.name)] = xr.DataArray(
+            forecasts[:, offset : offset + width, :]
+            .transpose(0, 2, 1)
+            .reshape(len(initializations), horizon, *field.shape[1:]),
+            dims=("init_time", "lead_time", *field.dims[1:]),
+            coords={
+                "init_time": initializations.astype("datetime64[ns]"),
+                "lead_time": np.arange(1, horizon + 1) * steps[0],
+                **{
+                    name: coord
+                    for name, coord in field.coords.items()
+                    if "time" not in coord.dims
+                },
+            },
+            attrs=field.attrs.copy(),
+        )
+        offset += width
+    return result
 
 
 def main() -> None:
@@ -140,7 +182,12 @@ def main() -> None:
     parser: argparse.ArgumentParser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--variable", required=True)
+    parser.add_argument(
+        "--variable",
+        action="extend",
+        nargs="+",
+        help="Target variables; defaults to all data variables. May be repeated.",
+    )
     parser.add_argument("--init-time", required=True, action="append")
     parser.add_argument("--context-length", type=int, default=512)
     parser.add_argument("--horizon", type=int, default=40)
@@ -148,13 +195,13 @@ def main() -> None:
         "--batch-size",
         type=int,
         default=32,
-        help="Grid cells per call in independent mode only",
+        help="Target variates per call in independent mode only",
     )
     parser.add_argument(
         "--grouping",
         choices=("joint", "independent"),
         default="joint",
-        help="Jointly forecast all grid cells as targets in one group (default)",
+        help="Jointly forecast all variables, levels and grid cells as targets in one group (default)",
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--revision", default="main")
@@ -195,7 +242,7 @@ def main() -> None:
 
     with xr.open_dataset(args.input) as dataset:
         forecasts: xr.Dataset = generate_forecasts(
-            dataset[args.variable],
+            dataset[args.variable] if args.variable else dataset,
             [np.datetime64(value) for value in args.init_time],
             predict,
             context_length=args.context_length,
@@ -210,9 +257,9 @@ def main() -> None:
         context_length=args.context_length,
         forecast_statistic="median",
         grouping=args.grouping,
-        inference="all grid cells as targets in one group"
+        inference="all variables, levels and grid cells as targets in one group"
         if args.grouping == "joint"
-        else "independent univariate grid cells",
+        else "independent target variates",
     )
     forecasts.to_netcdf(args.output)
     print(f"Wrote {args.output}")

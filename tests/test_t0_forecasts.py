@@ -255,16 +255,23 @@ def test_joint_group_preserves_cross_cell_context_and_all_targets() -> None:
         )
 
 
+@pytest.mark.parametrize("selection", ["single", "multiple", "all"])
 @pytest.mark.parametrize("grouping", ["joint", "independent"])
 def test_cli_passes_group_ids_for_all_grid_targets(
     grouping: Literal["joint", "independent"],
+    selection: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     history: xr.DataArray = make_history()
     input_path: Path = tmp_path / "history.nc"
     output_path: Path = tmp_path / "forecast.nc"
-    history.to_dataset().to_netcdf(input_path)
+    dataset: xr.Dataset = history.to_dataset()
+    dataset["eastward_wind"] = xr.concat(
+        [history + 100, history + 200], dim=xr.IndexVariable("level", [500, 850])
+    )
+    dataset.to_netcdf(input_path)
+    targets: int = 6 if selection == "single" else 18
     model: MagicMock = MagicMock()
 
     def predict(
@@ -276,8 +283,8 @@ def test_cli_passes_group_ids_for_all_grid_targets(
     ) -> MagicMock:
         assert quantile_levels == [0.5]
         if grouping == "joint":
-            assert len(context) == 6
-            np.testing.assert_array_equal(group_ids, np.zeros(6, dtype=np.int64))
+            assert len(context) == targets
+            np.testing.assert_array_equal(group_ids, np.zeros(targets, dtype=np.int64))
         else:
             assert len(context) == 2
             assert group_ids is None
@@ -300,8 +307,6 @@ def test_cli_passes_group_ids_for_all_grid_targets(
         str(input_path),
         "--output",
         str(output_path),
-        "--variable",
-        "surface_air_temperature",
         "--init-time",
         "2024-06-01T12",
         "--context-length",
@@ -311,13 +316,147 @@ def test_cli_passes_group_ids_for_all_grid_targets(
         "--batch-size",
         "2",
     ]
+    if selection == "single":
+        arguments.extend(["--variable", "surface_air_temperature"])
+    elif selection == "multiple":
+        arguments.extend(
+            ["--variable", "surface_air_temperature", "--variable", "eastward_wind"]
+        )
     if grouping == "independent":
         arguments.extend(["--grouping", "independent"])
     monkeypatch.setattr(sys, "argv", arguments)
     t0_forecasts.main()
-    assert model.predict.call_count == (1 if grouping == "joint" else 3)
+    assert model.predict.call_count == (1 if grouping == "joint" else targets // 2)
     with xr.open_dataset(output_path, decode_timedelta=True) as result:
         assert result.attrs["grouping"] == grouping
+        assert set(result.data_vars) == (
+            {"surface_air_temperature"}
+            if selection == "single"
+            else set(dataset.data_vars)
+        )
+        if selection != "single":
+            np.testing.assert_array_equal(
+                result.eastward_wind.values[0, 0],
+                dataset.eastward_wind.isel(time=2).values,
+            )
         np.testing.assert_array_equal(
             result.surface_air_temperature.values[0, 0], history.values[2]
         )
+
+
+def test_mixed_variables_levels_share_one_group_and_restore_dimensions(
+    tmp_path: Path,
+) -> None:
+    surface: xr.DataArray = make_history().assign_coords(longitude=[-90, 0, 90])
+    upper: xr.DataArray = xr.concat(
+        [surface + 100, surface + 200], dim=xr.IndexVariable("pressure", [500, 850])
+    ).transpose("longitude", "pressure", "time", "latitude")
+    upper.attrs = {"units": "m s-1"}
+    history: xr.Dataset = xr.Dataset(
+        {"surface_air_temperature": surface, "eastward_wind": upper}
+    )
+    history.pressure.attrs["units"] = "hPa"
+    calls: list[NDArray[np.float32]] = []
+
+    def predict(context: NDArray[np.float32], horizon: int) -> NDArray[np.float32]:
+        calls.append(context.copy())
+        return persistence(context, horizon) + context[:, -1].mean()
+
+    result: xr.Dataset = generate_forecasts(
+        history,
+        [surface.time.values[2], surface.time.values[4]],
+        predict,
+        context_length=3,
+        horizon=2,
+        batch_size=2,
+    )
+    assert [call.shape for call in calls] == [(18, 3), (18, 3)]
+    assert result.surface_air_temperature.dims == (
+        "init_time",
+        "lead_time",
+        "latitude",
+        "longitude",
+    )
+    assert result.eastward_wind.sizes["pressure"] == 2
+    normalized: xr.Dataset = history.assign_coords(
+        longitude=history.longitude % 360
+    ).sortby("longitude")
+    for index, stop in enumerate([2, 4]):
+        expected_context: NDArray[np.float32] = np.concatenate(
+            [
+                field.transpose("time", ...)
+                .isel(time=slice(stop - 2, stop + 1))
+                .values.reshape(3, -1)
+                .T
+                for field in normalized.data_vars.values()
+            ]
+        )
+        # Row order may differ; every real series must appear exactly once.
+        np.testing.assert_array_equal(
+            np.sort(calls[index], axis=0), np.sort(expected_context, axis=0)
+        )
+        for name in history.data_vars:
+            expected: xr.DataArray = (
+                normalized[name].isel(time=stop, drop=True)
+                + expected_context[:, -1].mean()
+            )
+            actual: xr.DataArray = (
+                result[name]
+                .isel(init_time=index, lead_time=0, drop=True)
+                .transpose(*expected.dims)
+            )
+            xr.testing.assert_allclose(actual, expected)
+            assert result[name].attrs == history[name].attrs
+    assert result.pressure.attrs == history.pressure.attrs
+    result.to_netcdf(tmp_path / "mixed.nc")
+    with xr.open_dataset(tmp_path / "mixed.nc", decode_timedelta=True) as restored:
+        xr.testing.assert_identical(result, restored)
+
+
+def test_rejects_static_fields_in_target_dataset() -> None:
+    history: xr.Dataset = make_history().to_dataset()
+    history["static"] = history.surface_air_temperature.isel(time=0, drop=True)
+    with pytest.raises(ValueError, match="time"):
+        generate_forecasts(
+            history, [history.time.values[2]], persistence, context_length=3
+        )
+
+
+def test_multiple_extra_axes_and_future_values_do_not_leak() -> None:
+    surface: xr.DataArray = make_history()
+    upper: xr.DataArray = surface.expand_dims(level=[300, 500], member=[0, 1, 2]).copy(
+        deep=True
+    )
+    history: xr.Dataset = xr.Dataset(
+        {"surface_air_temperature": surface, "air_temperature": upper}
+    )
+    modified: xr.Dataset = history.copy(deep=True)
+    modified["surface_air_temperature"].loc[{"time": history.time.values[3:]}] = np.nan
+    modified["air_temperature"].loc[{"time": history.time.values[3:]}] = np.nan
+    original: xr.Dataset = generate_forecasts(
+        history, [history.time.values[2]], persistence, context_length=3, horizon=2
+    )
+    actual: xr.Dataset = generate_forecasts(
+        modified, [history.time.values[2]], persistence, context_length=3, horizon=2
+    )
+    xr.testing.assert_identical(actual, original)
+    assert actual.air_temperature.dims == (
+        "init_time",
+        "lead_time",
+        "level",
+        "member",
+        "latitude",
+        "longitude",
+    )
+    assert actual.air_temperature.shape == (1, 2, 2, 3, 2, 3)
+
+
+@pytest.mark.parametrize("axis", ["init_time", "lead_time"])
+def test_rejects_reserved_auxiliary_coordinate_before_prediction(axis: str) -> None:
+    history: xr.DataArray = make_history().assign_coords({axis: 0})
+
+    def predict(context: NDArray[np.float32], horizon: int) -> NDArray[np.float32]:
+        raise AssertionError("Invalid coordinates must be rejected before inference")
+
+    with pytest.raises(ValueError, match="reserved"):
+        generate_forecasts(history, [history.time.values[2]], predict, context_length=3)
